@@ -365,7 +365,7 @@ days required for promotion for men and women.
 ggplot(data = gender_mean_advancement_time, mapping = aes(x = as_factor(gender), y = Days_to_next_paygrade)) + geom_bar(stat="identity")
 ```
 
-![](Exercise5_files/figure-gfm/plot%20gender_mean_advancement_time-1.png)<!-- -->
+![](Exercise5_files/figure-gfm/plot-gender_mean_advancement_time-1.png)<!-- -->
 
 ## Q2. Are these differences themselves different by examiners’ race?
 
