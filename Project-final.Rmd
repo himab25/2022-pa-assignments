@@ -1,0 +1,705 @@
+---
+title: "Final Project"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+rm(list = ls())
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+library(tidyverse)
+```
+#### Introduction
+
+In this project we will be examining the given dataset using various combination of variables and their analysis to address the main challenges faced by USTPO organization which are :
+
+* Application backlog
+* Shortage of qualified examiners
+* Concerns about inequities inside the organization that relate to gender and race of the examiners
+
+After studying the patent examiner data from various angles throughout the duration of the course, our group chose to focus on determining what factors appear to influence the **promotion and exit of patent examiners as well as study the role of gender and race in these processes.** In our previous exercise, we were not able to identify a factor (such as gender or race) that appeared to have a relationship with the length of time it takes for examiners to be promoted, so we hoped to continue probing until we were able to identify other factors that might be having an effect on promotions and average tenure for examiners.In addition, we analysed time to exit for examiners to study the attrition.
+
+#### Data Preparation Steps
+
+* Loading data files (app_data_sample,examiner_gs,examiner_ids) 
+* Creating new variables - gender,race,tenure as done in earlier exercises     
+* Mapping the data files with correct ids of examiners
+* Removing rows with NA values for gender and race wherever needed
+* Calculation of time variables such as days in paygrade, application processing times and days to exit
+
+```{r prep-steps, include = FALSE}
+# set path for R to find our data
+data_path <- "C:/Users/Hima25/OneDrive/Desktop/Ppl Ana/USPTO_data/"
+library(arrow) # to be able to load data in the .parquet format
+# read application data
+app_data_sample <- read_parquet(paste0(data_path,"app_data_sample.parquet"))
+library(gender)
+#install_genderdata_package() # only run this line the first time you use the package, to get data for it
+# get a list of first names without repetitions
+examiner_names <- app_data_sample %>% 
+  distinct(examiner_name_first)
+examiner_names_gender <- examiner_names %>% 
+  do(results = gender(.$examiner_name_first, method = "ssa")) %>% 
+  unnest(cols = c(results), keep_empty = TRUE) %>% 
+  select(
+    examiner_name_first = name,
+    gender,
+    proportion_female
+  )
+# remove extra columns from the gender table
+examiner_names_gender <- examiner_names_gender %>% 
+  select(examiner_name_first, gender)
+# joining gender back to the dataset
+app_data_sample <- app_data_sample %>% 
+  left_join(examiner_names_gender, by = "examiner_name_first")
+# cleaning up
+rm(examiner_names)
+rm(examiner_names_gender)
+gc()
+# Examiners' race
+library(wru)
+examiner_surnames <- app_data_sample %>% 
+  select(surname = examiner_name_last) %>% 
+  distinct()
+examiner_race <- predict_race(voter.file = examiner_surnames, surname.only = T) %>% 
+  as_tibble()
+examiner_race <- examiner_race %>% 
+  mutate(max_race_p = pmax(pred.asi, pred.bla, pred.his, pred.oth, pred.whi)) %>% 
+  mutate(race = case_when(
+    max_race_p == pred.asi ~ "Asian",
+    max_race_p == pred.bla ~ "black",
+    max_race_p == pred.his ~ "Hispanic",
+    max_race_p == pred.oth ~ "other",
+    max_race_p == pred.whi ~ "white",
+    TRUE ~ NA_character_
+  ))
+examiner_race <- examiner_race %>% 
+  select(surname,race)
+app_data_sample <- app_data_sample %>% 
+  left_join(examiner_race, by = c("examiner_name_last" = "surname"))
+rm(examiner_race)
+rm(examiner_surnames)
+gc()
+# Examiner's tenure
+library(lubridate) # to work with dates
+examiner_dates <- app_data_sample %>% 
+  select(examiner_id, filing_date, appl_status_date) 
+examiner_dates <- examiner_dates %>% 
+  mutate(start_date = ymd(filing_date), end_date = as_date(dmy_hms(appl_status_date))) %>% 
+  filter(year(end_date)<2018) %>% 
+  group_by(examiner_id) %>% 
+  summarise(
+    earliest_date = min(start_date, na.rm = TRUE), 
+    latest_date = max(end_date, na.rm = TRUE),
+    tenure_days = interval(earliest_date, latest_date) %/% days(1)
+    )
+app_data_sample <- app_data_sample %>% 
+  left_join(examiner_dates, by = "examiner_id")
+rm(examiner_dates)
+gc()
+```
+
+
+```{r load-paygrade-data, include = FALSE}
+#Load the paygrade file
+examiner_gs <- read_csv(paste0(data_path,"examiner_gs.csv"))
+examiner_ids <- read_csv(paste0(data_path,"examiner_ids.csv"))
+```
+
+
+```{r join-id, include = FALSE}
+#The ID fields in the examiner_gs.csv file don't match those in the application data file. Because 
+#we'll need to join these files later, we need to bring in the proper ID field, by using the cross-walk 
+#file examiner_ids.
+
+## Replace various IDs with examiner ID
+examiner_gs <- examiner_gs %>% 
+  left_join(examiner_ids) %>% 
+  select(
+    grade = examiner_grade,
+    start_date,
+    end_date,
+    examiner_id = patex_id
+  )
+```
+
+
+```{r get-time-in-grade, include = FALSE}
+
+#Now we need to estimate the average time each examiner spends in a given GS paygrade. Note that the less-biased way to do that is to exclude the latest or highest grade for each examiner. This is because after examiners reach the highest grade (which is usually grade 14 in this context), they cannot advance to the next grade. Imagine someone who advances through grades 11, 12 and 13 in just 18 months (so, the average for that examiner is 6 months per grade), but then stays in grade 14 and works at the agency for another ten years. If you were to average all grades, it would look like it took the examiner several years on average to get promoted through each grade. This is because the last grade biases the average positively. 
+
+#Similarly, for examiners who get promoted right before the end of our sample's time window, the very short time they stay in the highest observed grade will negatively bias the average. It will look like the examiner has progressed through the grades way faster than she did.
+
+
+## Estimate time in grade
+time_in_grade <- examiner_gs %>% 
+  mutate(
+    start_date = mdy(start_date), # converting into proper date type
+    end_date = mdy(end_date), # converting into proper date type
+    days_in_grade = interval(start_date, end_date) %/% days(1)
+  ) %>% 
+  group_by(examiner_id) %>% 
+  filter(grade!=max(grade, na.rm = TRUE)) %>% # dropping the highest grade record
+  summarise(mean_days_in_grade = mean(days_in_grade, na.rm = TRUE))
+time_in_grade
+```
+
+
+```{r app-proc-time, include = FALSE}
+#Let's get the measure of application processing time for each examiner. We'll do this by "collapsing" the dataframe from application level to examiner level (i.e., one record for each examiner, not multiple records).
+
+## Prepare application data
+examiner_data <- app_data_sample %>% 
+  filter(disposal_type!="PEND") %>% # here, we exclude in-process applications
+  mutate(
+    app_start_date = ymd(filing_date),
+    app_end_date = case_when(
+      disposal_type == "ISS" ~ ymd(patent_issue_date), # for issued patents
+      disposal_type == "ABN" ~ ymd(abandon_date), # for abandoned applications
+      TRUE ~ NA_Date_
+    ),
+    app_proc_days = interval(app_start_date, app_end_date) %/% days(1)) %>% 
+  filter(app_proc_days>0 & app_proc_days < 3650) %>% # limit to 0-10 years
+  group_by(examiner_id) %>% 
+  summarise(
+    app_count = n(),
+    tc = min(tc, na.rm = TRUE),
+    gender = first(gender),
+    race = first(race),
+    tenure_days = max(tenure_days, na.rm = TRUE),
+    mean_app_proc_days = mean(app_proc_days, na.rm = TRUE)
+  )
+examiner_data
+```
+
+
+```{r add-time-in-grade, include = FALSE}
+#Now, let's join in the time in grade data.
+examiner_data <- examiner_data %>% 
+  left_join(time_in_grade)
+examiner_data
+```
+
+* Eliminating negative mean_days_in_grade
+
+```{r}
+b_examiner_data = examiner_data %>% filter(examiner_data$mean_days_in_grade > 0)
+```
+
+
+* Finding examiner tenure - Removing IDs whose latest date is the date of data extraction
+
+```{r}
+#counting how many times the latest date appears. 2017-5-19 appears 1145 times.
+#Most likely this is the global end date of the dataset
+x = app_data_sample %>% 
+  distinct(examiner_id, earliest_date, latest_date) %>% count(latest_date)
+
+## 2 weeks before the global end date of the data set is when we start looking 
+#for people who quit. Taking 2017-05-01
+y = app_data_sample %>% 
+  distinct(examiner_id, earliest_date, latest_date) %>% filter(latest_date <= '2017-05-01')
+```
+
+* Estimating overall tenure
+
+```{r get-tenure}
+tenure_quitters <- y %>% 
+  mutate(
+    days_to_exit = interval(earliest_date, latest_date) %/% days(1)
+  )
+z <- b_examiner_data  %>% 
+  left_join(tenure_quitters, by = "examiner_id")
+
+# No.of applications received per month
+final_examiner_data <- z %>% 
+  mutate(
+    app_per_month = (app_count / tenure_days) * 30
+  )
+```
+
+#### Plot Analysis
+
+##### Plotting Number of people in each TC grouped by race
+
+```{r peopleinTc}
+RR = b_examiner_data %>% group_by(race,tc) %>% count()
+ggplot(data = RR, mapping = aes(x = as_factor(race), y = n, 
+  fill = as_factor(tc))) + geom_bar(stat="identity",position = "stack") + 
+  ggtitle("Number of People")
+```
+
+##### Calculating Mean advancement time based on days in grade filtered by Gender,race & TC
+
+```{r, include = FALSE}
+### Using Gender
+
+gender_mean_advancement_time = b_examiner_data %>% group_by(gender) %>% 
+  summarise(Days_to_next_paygrade = mean(mean_days_in_grade, na.rm = TRUE)) %>% filter(!is.na(gender))
+gender_mean_advancement_time
+
+### Gender Plot
+
+ggplot(data = gender_mean_advancement_time, 
+       mapping = aes(x = as_factor(gender), y = Days_to_next_paygrade)) + 
+geom_bar(stat="identity") + geom_text(aes(label = round(Days_to_next_paygrade,1)),
+            position = position_dodge(0.9), color="white",vjust = 1,hjust = 0.5)
+
+
+### Using Race
+
+race_mean_advancement_time = b_examiner_data %>% group_by(race) %>% 
+  summarise(Days_to_next_paygrade = mean(mean_days_in_grade, na.rm = TRUE))
+race_mean_advancement_time
+
+### Race Plot
+
+ggplot(data = race_mean_advancement_time, mapping = aes(x = as_factor(race), 
+  y = Days_to_next_paygrade)) + geom_bar(stat="identity") +
+  geom_text(aes(label = round(Days_to_next_paygrade,1)),
+          position = position_dodge(0.9), color="white",vjust = 1,hjust = 0.5)
+
+
+### Using Gender and Race together
+
+gen_race_mean_advancement_time = b_examiner_data %>% group_by(gender,race) %>% 
+  summarise(Days_to_next_paygrade = mean(mean_days_in_grade, na.rm = TRUE)) %>%     
+  filter(!is.na(gender))
+
+  
+### Plotting Gender and Race 
+
+ggplot(data = gen_race_mean_advancement_time, mapping = aes(x = as_factor(race), 
+  y = Days_to_next_paygrade, fill = as_factor(gender))) + 
+  geom_bar(stat="identity",position = "dodge")
+```
+
+
+```{r}
+### Using Gender and TC
+gender_tc_mean_advancement_time = b_examiner_data %>% group_by(gender,tc) %>% 
+  summarise(Days_to_next_paygrade = mean(mean_days_in_grade, na.rm = TRUE)) %>% 
+  filter(!is.na(gender))
+
+### Using Race and TC
+race_tc_mean_advancement_time = b_examiner_data %>% group_by(race,tc) %>% 
+  summarise(Days_to_next_paygrade = mean(mean_days_in_grade, na.rm = TRUE))
+
+### Using Gender,Race and TC together
+gen_race_tc_mean_advancement_time = b_examiner_data %>% 
+  group_by(gender,race,tc) %>% 
+  summarise(Days_to_next_paygrade = mean(mean_days_in_grade, na.rm = TRUE)) %>% 
+  filter(!is.na(gender))
+
+## males
+male_race_mean_advancement_time <- gen_race_tc_mean_advancement_time %>% 
+  filter(gender == 'male')
+
+## females
+female_race_mean_advancement_time <- gen_race_tc_mean_advancement_time %>% 
+  filter(gender == 'female')
+```
+
+```{r, include=FALSE}
+### Gender and TC Plot
+
+plot1 = ggplot(data = gender_tc_mean_advancement_time,mapping = aes(x = as_factor(gender), 
+  y = Days_to_next_paygrade,fill = as_factor(tc))) + 
+  geom_bar(stat="identity",position = "dodge")
+
+
+### Race and TC Plot
+
+plot2 = ggplot(data = race_tc_mean_advancement_time, mapping = aes(x = as_factor(race), 
+ y = Days_to_next_paygrade, fill = as_factor(tc))) + 
+  geom_bar(stat="identity",position = "dodge")
+
+### Plotting with Gender,Race and TC
+
+plot3 = ggplot(data = male_race_mean_advancement_time, mapping = aes(x = as_factor(race), 
+  y = Days_to_next_paygrade, fill = as_factor(tc))) + 
+  geom_bar(stat="identity",position = "dodge") + ggtitle("Males") 
+
+
+plot4 = ggplot(data = female_race_mean_advancement_time, mapping = aes(x = as_factor(race), 
+  y = Days_to_next_paygrade, fill = as_factor(tc))) + 
+  geom_bar(stat="identity",position = "dodge") + ggtitle("Females")
+```
+
+```{r plots1}
+library("gridExtra")
+grid.arrange(plot1, plot2, plot3, plot4, nrow = 2, ncol = 2)
+
+#scatter plot
+library(ggpubr)
+# plotting mean_days_in_grade with mean_app_proc_days
+ggscatter(b_examiner_data %>% filter(mean_days_in_grade < 2000), 
+          x = "mean_app_proc_days", y = "mean_days_in_grade", 
+      conf.int = TRUE, color = "tc", cor.coef = TRUE, cor.method = "pearson") +
+geom_smooth(method='lm', se = FALSE, color = "#0072B2", linetype = "solid") +  
+  theme_minimal()
+```
+
+##### Analysis - Mean advancement time in paygrade
+
+While observing the time in paygrade, there was no correlation between gender, race or TC, however this may mean that the time in pay grade may be more correlated with operational or cultural differences in the TCs than with examiner gender differences.
+	
+When we examined the effect of race and TC together, we observed that black examiners at TC 1700 waited up to twice as long to advance as did their peers of other races or black examiners at other TCs. Closer examination of the data revealed that the small number of black examiners at these TCs might be skewing their mean days in pay grade higher relative to that of other races, so we are hesitant to form conclusions about the effect of race based on this data.
+	
+When we evaluated the mean application prosecution time vs mean days in pay grade, we did not find a correlation (0.0006). The average prosecution time does not appear to affect how quickly examiners advance. The low number of black and Hispanic examiners across TCs is striking and the fact that there is both a shortage of examiners and an extremely low number of black and Hispanic examiners makes us wonder if there are factors leading to applicants from these groups not being hired as frequently, or to members of these groups not applying for examiner jobs in the first place.
+	
+Since there are low numbers of black and Hispanic examiners, it is possible that their average application prosecution times are skewed. If this type of data is being viewed and considered by hiring managers, they may have incorrect conclusions about their performance, which could affect their future hiring decisions. It would be useful to learn more about the hiring process for patent examiners in order to determine how hiring might be affecting the current demographic makeup of the workforce. 
+
+##### Calculating Mean application processing time based on processing time per application filtered by Gender,race and tc
+
+```{r, include = FALSE}
+
+### Using Gender
+
+gender_mean_proc_time = b_examiner_data %>% group_by(gender) %>% 
+  summarise(app_proc_time = mean(mean_app_proc_days, na.rm = TRUE)) %>% 
+  filter(!is.na(gender))
+
+
+### Gender Plot
+
+ggplot(data = gender_mean_proc_time, 
+       mapping = aes(x = as_factor(gender), y = app_proc_time)) + 
+  geom_bar(stat="identity") +
+  geom_text(aes(label = round(app_proc_time,1)),
+            position = position_dodge(0.9), color="white",vjust = 1,hjust = 0.5)
+
+
+### Using Race
+
+race_mean_proc_time = b_examiner_data %>% group_by(race) %>% 
+  summarise(app_proc_time = mean(mean_app_proc_days, na.rm = TRUE))
+
+
+### Race Plot
+
+ggplot(data = race_mean_proc_time, mapping = aes(x = as_factor(race), 
+                                                        y = app_proc_time)) + 
+  geom_bar(stat="identity") +
+  geom_text(aes(label = round(app_proc_time,1)),
+            position = position_dodge(0.9), color="white",vjust = 1,hjust = 0.5)
+
+### Using Gender and Race together
+
+gen_race_mean_proc_time = b_examiner_data %>% group_by(gender,race) %>% 
+  summarise(app_proc_time = mean(mean_app_proc_days, na.rm = TRUE)) %>% 
+  filter(!is.na(gender))
+
+  
+### Plotting Gender and Race 
+
+ggplot(data = gen_race_mean_proc_time, mapping = aes(x = as_factor(race), 
+y = app_proc_time, fill = as_factor(gender))) + 
+  geom_bar(stat="identity",position = "dodge")
+
+```
+
+```{r}
+### Using Gender and TC
+gender_tc_mean_proc_time = b_examiner_data %>% group_by(gender,tc) %>% 
+  summarise(app_proc_time = mean(mean_app_proc_days, na.rm = TRUE)) %>% 
+  filter(!is.na(gender))
+
+### Using Race and TC
+race_tc_mean_proc_time = b_examiner_data %>% group_by(race,tc) %>% 
+  summarise(app_proc_time = mean(mean_app_proc_days, na.rm = TRUE))
+
+### Using Gender,Race and TC together
+gen_race_tc_mean_proc_time = b_examiner_data %>% group_by(gender,race,tc) %>% 
+  summarise(app_proc_time = mean(mean_app_proc_days, na.rm = TRUE)) %>% 
+  filter(!is.na(gender))
+
+## males
+male_proc_time <- gen_race_tc_mean_proc_time %>% filter(gender == 'male')
+
+## females
+female_proc_time <- gen_race_tc_mean_proc_time %>% filter(gender == 'female')
+```
+
+```{r, include=FALSE}
+###################PLOTS######################
+
+### Gender and TC Plot
+
+plot5 = ggplot(data = gender_tc_mean_proc_time, 
+       mapping = aes(x = as_factor(gender), y = app_proc_time, 
+                     fill = as_factor(tc))) + 
+  geom_bar(stat="identity",position = "dodge")
+
+### Race and TC Plot
+
+plot6 = ggplot(data = race_tc_mean_proc_time, mapping = aes(x = as_factor(race), 
+        y = app_proc_time, fill = as_factor(tc))) + 
+  geom_bar(stat="identity",position = "dodge")
+
+  
+### Plotting with Gender,Race and TC
+
+
+plot7 = ggplot(data = male_proc_time, mapping = aes(x = as_factor(race), 
+                y = app_proc_time, fill = as_factor(tc))) + 
+  geom_bar(stat="identity",position = "dodge") + ggtitle("Males")
+
+
+plot8 = ggplot(data = female_proc_time, mapping = aes(x = as_factor(race), 
+     y = app_proc_time, fill = as_factor(tc))) + 
+  geom_bar(stat="identity",position = "dodge") + ggtitle("Females")
+```
+
+```{r plots2}
+
+grid.arrange(plot5, plot6, plot7, plot8, nrow = 2, ncol = 2)
+
+#scatter plot plotting app_per_month with mean_processing_time
+ggscatter(final_examiner_data %>% filter(app_per_month < 15), 
+    x = "mean_app_proc_days", y = "app_per_month") + geom_smooth(method='lm',
+                                  se = FALSE, linetype = "solid")
+```
+
+##### Plotting mean application prosecution time vs mean days in same paygrade per tc as a function of gender & race
+
+```{r, include=FALSE}
+# fn of gender
+tc1600_examiner_data = final_examiner_data %>% 
+  filter(mean_days_in_grade < 2000) %>% filter (tc == '1600') %>% 
+  filter(!is.na(gender))
+  g1 = ggplot(data = tc1600_examiner_data, mapping = aes(x = mean_app_proc_days, 
+      y = mean_days_in_grade, colour = as_factor(gender))) + geom_point() + 
+    ggtitle("TC 1600") + geom_smooth(method='lm', se = FALSE, color = "#0072B2", 
+                                     linetype = "solid") +   theme_minimal()
+
+#fn of race
+tc1600_examiner_data = tc1600_examiner_data %>% filter(!is.na(race))
+  r1 = ggplot(data = tc1600_examiner_data, mapping = aes(x = mean_app_proc_days, 
+        y = mean_days_in_grade, colour = as_factor(race)))  + geom_point()+
+  ggtitle("TC 1600") + 
+    geom_smooth(method='lm', se = FALSE, linetype = "solid")  + theme_minimal()
+
+#fn of gender
+tc1700_examiner_data = final_examiner_data %>% 
+  filter(mean_days_in_grade < 2000) %>% filter (tc == '1700') %>% 
+  filter(!is.na(gender))
+  g2 = ggplot(data = tc1700_examiner_data, mapping = aes(x = mean_app_proc_days, 
+  y = mean_days_in_grade, colour = as_factor(gender)))  +  geom_point()+  
+  ggtitle("TC 1700") + geom_smooth(method='lm', se = FALSE, 
+                                   linetype = "solid")  + theme_minimal()
+
+#fn of race
+tc1700_examiner_data =tc1700_examiner_data %>% filter(!is.na(race))
+  r2 = ggplot(data = tc1700_examiner_data, mapping = aes(x = mean_app_proc_days, 
+  y = mean_days_in_grade, colour = as_factor(race)))  +  geom_point()+  
+  ggtitle("TC 1700") + geom_smooth(method='lm', se = FALSE, 
+                                   linetype = "solid") + theme_minimal()
+
+#fn of gender
+tc2100_examiner_data = final_examiner_data %>% 
+  filter(mean_days_in_grade < 2000) %>% filter (tc == '2100') %>% 
+  filter(!is.na(gender))
+ g3 = ggplot(data = tc2100_examiner_data, mapping = aes(x = mean_app_proc_days, 
+  y = mean_days_in_grade, colour = as_factor(gender)))  +  geom_point()+  
+  ggtitle("TC 2100") + geom_smooth(method='lm', se = FALSE,linetype = "solid") +
+   theme_minimal()
+
+#fn of race
+tc2100_examiner_data = tc2100_examiner_data %>% filter(!is.na(race))
+ r3 = ggplot(data = tc2100_examiner_data, mapping = aes(x = mean_app_proc_days, 
+  y = mean_days_in_grade, colour = as_factor(race)))  +
+  geom_point()+  ggtitle("TC 2100") + geom_smooth(method='lm', se = FALSE, 
+                    linetype = "solid") +  theme_minimal()
+
+#fn of gender
+tc2400_examiner_data = final_examiner_data %>% 
+  filter(mean_days_in_grade < 2000) %>% filter (tc == '2400') %>% 
+  filter(!is.na(gender))
+  g4 = ggplot(data = tc2400_examiner_data, mapping = aes(x = mean_app_proc_days, 
+  y = mean_days_in_grade, colour = as_factor(gender)))  +  geom_point()+  
+  ggtitle("TC 2400") + geom_smooth(method='lm', se = FALSE, linetype = "solid")+
+  theme_minimal()
+
+#fn of race
+tc2400_examiner_data = tc2400_examiner_data %>% filter(!is.na(race))
+r4 = ggplot(data = tc2400_examiner_data, mapping = aes(x = mean_app_proc_days, 
+  y = mean_days_in_grade, colour = as_factor(race)))  +  geom_point()+  
+ggtitle("TC 2400") + geom_smooth(method='lm', se = FALSE, linetype = "solid") +
+  theme_minimal()
+```
+
+```{r plots4}
+grid.arrange(g1, r2, g3, r4, nrow = 2, ncol = 2)
+```
+
+##### Analysis - Mean application processing time
+
+Examiner performance is rated on Productivity, Quality of work, Docket management and Stakeholder interaction. Application prosecution time has no relation to Quality of work or stakeholder interaction. Moreover, Production goals for examiners are based on number of production units (closed applications), which in addition to the prosecution time, takes into account both the seniority level of the examiner and the technology complexity. This means the expected processing time would differ amongst examiners, certainly so when they work in different Technology Centers -with different technology complexity- or even different Art Units.
+
+Since we do not have the data for technology complexity and the method to calculate the complexity factor or quality factor to plug into our computation, we chose two measures to assess performance of examiners: (1) Mean Application Prosecution and (2) Number of Applications Assigned Per Month.
+
+We found no significant relationship between the rate of applications assigned each month and the speed of processing. This shows that the method by which the assignments were distributed are not unfair and the huge difference in figures of (app_per_month) amongst examiners can probably be explained with technology complexity and seniority levels.
+
+In our analysis of plots as shown above, We found that, for all categories, with the exception of black gender in TC 1700, the higher application prosecution time related to higher days in grade. This is an intuitive conclusion of; you work faster you move faster, and it’s supported by the data but with low significance.
+
+
+##### Tenure plots using days_to_exit
+
+```{r, include = FALSE}
+
+### Using Gender
+
+gender_mean_days_to_exit = final_examiner_data %>% group_by(gender) %>% 
+  summarise(days_to_exit = mean(days_to_exit, na.rm = TRUE)) %>% 
+  filter(!is.na(gender))
+
+### Gender Plot
+
+ggplot(data = gender_mean_days_to_exit, 
+       mapping = aes(x = as_factor(gender), y = days_to_exit)) + 
+  geom_bar(stat="identity") +  geom_text(aes(label = round(days_to_exit,1)),
+            position = position_dodge(0.9), color="white",vjust = 1,hjust = 0.5)
+
+
+### Using Race
+
+race_mean_days_to_exit = final_examiner_data %>% group_by(race) %>% 
+  summarise(app_days_to_exit = mean(days_to_exit, na.rm = TRUE))
+
+
+### Race Plot
+
+ggplot(data = race_mean_days_to_exit, mapping = aes(x = as_factor(race), 
+  y = app_days_to_exit)) +   geom_bar(stat="identity") +
+  geom_text(aes(label = round(app_days_to_exit,1)),
+            position = position_dodge(0.9), color="white",vjust = 1,hjust = 0.5)
+
+### Using Gender and Race together
+
+gen_race_mean_days_to_exit = final_examiner_data %>% group_by(gender,race) %>% 
+  summarise(app_days_to_exit = mean(days_to_exit, na.rm = TRUE)) %>% 
+  filter(!is.na(gender))
+
+  
+### Plotting Gender and Race 
+
+ggplot(data = gen_race_mean_days_to_exit, mapping = aes(x = as_factor(race), 
+  y = app_days_to_exit, fill = as_factor(gender))) + 
+  geom_bar(stat="identity",position = "dodge")
+
+### Using Race and TC
+
+race_tc_mean_days_to_exit = final_examiner_data %>% group_by(race,tc) %>% 
+  summarise(app_days_to_exit = mean(days_to_exit, na.rm = TRUE))
+
+
+### Race and TC Plot
+
+ggplot(data = race_tc_mean_days_to_exit, mapping = aes(x = as_factor(race), 
+        y = app_days_to_exit, fill = as_factor(tc))) + 
+  geom_bar(stat="identity",position = "dodge")
+
+```
+
+```{r}
+### Using Gender and TC
+gender_tc_mean_days_to_exit = final_examiner_data %>% group_by(gender,tc) %>% 
+  summarise(app_days_to_exit = mean(days_to_exit, na.rm = TRUE)) %>%
+  filter(!is.na(gender))
+
+### Using Gender,Race and TC together
+gen_race_tc_mean_days_to_exit = final_examiner_data %>% 
+  group_by(gender,race,tc) %>% 
+  summarise(app_days_to_exit = mean(days_to_exit, na.rm = TRUE)) %>% 
+  filter(!is.na(gender))
+
+## males
+male_days_to_exit <- gen_race_tc_mean_days_to_exit %>% filter(gender == 'male')
+
+## females
+female_days_to_exit <- gen_race_tc_mean_days_to_exit %>% filter(gender == 'female')
+```
+
+```{r, include=FALSE}
+### Gender and TC Plot
+
+plot9 = ggplot(data = gender_tc_mean_days_to_exit, 
+       mapping = aes(x = as_factor(gender), y = app_days_to_exit, 
+  fill = as_factor(tc))) +   geom_bar(stat="identity",position = "dodge")
+
+plot10 = ggplot(data = male_days_to_exit, mapping = aes(x = as_factor(race), 
+    y = app_days_to_exit, fill = as_factor(tc))) + 
+  geom_bar(stat="identity",position = "dodge") + ggtitle("Males")
+
+plot11 = ggplot(data = female_days_to_exit, mapping = aes(x = as_factor(race), 
+                            y = app_days_to_exit, fill = as_factor(tc))) + 
+  geom_bar(stat="identity",position = "dodge") + ggtitle("Females")
+```
+
+```{r, plots3}
+grid.arrange(plot9, plot10, plot11, nrow = 2, ncol = 2)
+```
+
+
+##### Analysis - Mean days to exit
+
+During our analysis, the difference of 208 days of tenure was quite significant as females stay in the organization around 7 months on average more than the males in the organization. With respect to the race of the examiners, it can be seen that Asians and Whites stay in the organization longer than Blacks and Hispanics by around 400-500 days, which is quite significant as it is over 1 year. 
+
+It can also be seen above that males of every race are staying in the organization for lesser time than females of the corresponding race. It can be clearly seen that both males and females show lowest tenure in TC 2400, while TC 1600 shows the highest tenure. This could mean that the work environment in TC 2400 could be more challenging or not challenging enough. 
+
+With respect to race and TC, no conclusive insights could be established from the variation found in the data. It can also be seen from the female graph of race vs tenure days that there are no Black and Hispanic females in TC 1600 and from the male graph of race vs tenure days, we see that Hispanic males in TC 1600 leave the organization much earlier than others. This confirms the inequity concerns within the organization and can add to the examiner shortage problem as people are leaving the organization perhaps much earlier than expected causing application backlog.
+
+
+
+#### Descriptive statistics and regressions
+
+Let's run a couple of simple regressions for mean days in a pay grade.
+
+```{r reg-sample}
+library(modelsummary)
+models <- list()
+
+models[['m1']] <- lm(mean_days_in_grade ~ 1 + mean_app_proc_days, 
+                     data = final_examiner_data) 
+
+models[['m2']] <- lm(mean_days_in_grade ~ 1 + mean_app_proc_days + as_factor(gender), 
+         data = final_examiner_data) 
+models[['m3']] <- lm(mean_days_in_grade ~ 1 + mean_app_proc_days + as_factor(race), 
+         data = final_examiner_data) 
+
+modelsummary(models)
+```
+
+Looking at the linear regression models as shown above for the mean application processing days, gender, and race for different TCs, there was a weak relationship for any variable or combination of variable, meaning that these variables are not indicators for predicting the mean days in a pay grade. To conclude, these results confirm that no combination of race, gender or processing days explain the number of days a person spends in a pay grade, and that the promotion of an individual may be solely based on the time that person spends in a role or there are external factors other than gender, race, or performance to be considered.
+
+
+Let's run a couple of simple regressions for mean exit days.
+
+```{r reg-sample2}
+library(modelsummary)
+models <- list()
+
+##General regression
+models[['d1']] <- lm(days_to_exit ~ 1 + mean_app_proc_days, 
+                     data = final_examiner_data) 
+
+##TC2400 regressions
+models[['d2400_1']] <- lm(days_to_exit ~ 1 + mean_app_proc_days, 
+                          data = tc2400_examiner_data)
+models[['d2400_gender']] <- lm(days_to_exit ~ 1 + mean_app_proc_days 
+                               + as_factor(gender),data = tc2400_examiner_data) 
+models[['d2400_race']] <- lm(days_to_exit ~ 1 + mean_app_proc_days 
+                             + as_factor(race), data = tc2400_examiner_data)
+
+modelsummary(models)
+```
+
+While the linear regressions for days to exit continued to display a weak relationship with the variables or combination of variables, this relationship grew stronger when isolating the regression for the TC 2400 indicating that just under half of the variance of the dependent variable is explained by the independent variables used. Lastly within TC 2400, the regression with the race variable displayed the strongest relationship out of the regressions performed, making this an area to further explore in a future more in-depth analysis.
+
+#### Conclusion
+
+*	In conclusion, our analysis confirms the qualified examiner shortage problem as people are leaving the organization perhaps much earlier than expected (as seen from avg tenure and avg days to exit data), causing application backlog. Moreover, there’s a huge spread of application per months amongst employees which can be due to technology complexity and/or seniority level, but when that’s not the case, this would be a key reason for the application backlog.
+*	As USPTO websites states that seniority level is a factor of the equation for assigning applications to examiners for a certain period, examiners who entered and exited at a lower level wouldn’t qualify to work on a large number of applications, hence affecting the overall backlog. USTPO should improve their attrition rate and/or loosen their seniority production requirement to reduce the backlog as well as improve the shortage of qualified examiners.
+*	With respect to the number of data points, it is quite apparent from the graph of the number of people in each TC categorized by race that the Blacks and Hispanics are underrepresented in this organization and have very few examiners in these races as data points. This is important because it can skew the analysis heavily as such a small number (single digit) of data points is not representative of the group and can skew the data and biases may emerge. This means that the concerns about inequities within USPO is real and effort should be made to improve the representation of minorities within the organization.
+
